@@ -5,6 +5,7 @@ import {
   dilateMask,
   getBasicLatinCoverage,
   getGridPixelsPerEm,
+  getPixelGrid,
   type CellMask,
   type FontMetrics,
 } from "../src/font-pixelizer";
@@ -212,6 +213,61 @@ describe("font pixelizer core", () => {
     expect(getGridPixelsPerEm(powerOfTwoMetrics, { pixelsPerEm: 20, threshold: 0.5, expand: 0 })).toBe(16);
   });
 
+  it("grows the pixel grid past declared metrics so tall or deep glyphs are not clipped", () => {
+    const tallGlyph = new opentype.Glyph({
+      name: "H",
+      unicode: 72,
+      advanceWidth: 600,
+      path: rectanglePathWithBounds(-120, -360, 720, 1240),
+    });
+
+    const grid = getPixelGrid([tallGlyph], metrics, { pixelsPerEm: 10, threshold: 0.5, expand: 0 });
+
+    expect(grid.cellSize).toBe(100);
+    expect(grid.top).toBeGreaterThanOrEqual(1240);
+    expect(grid.bottom).toBeLessThanOrEqual(-360);
+    expect(grid.top % grid.cellSize).toBe(0);
+    expect(Math.abs(grid.bottom % grid.cellSize)).toBe(0);
+    expect(grid.rows).toBe((grid.top - grid.bottom) / grid.cellSize);
+  });
+
+  it("reserves dilation room around the pixel grid", () => {
+    const glyph = new opentype.Glyph({
+      name: "H",
+      unicode: 72,
+      advanceWidth: 600,
+      path: rectanglePathWithBounds(0, 0, 600, 700),
+    });
+
+    const tight = getPixelGrid([glyph], metrics, { pixelsPerEm: 10, threshold: 0.5, expand: 0 });
+    const expanded = getPixelGrid([glyph], metrics, { pixelsPerEm: 10, threshold: 0.5, expand: 2 });
+
+    expect(expanded.top - tight.top).toBe(200);
+    expect(tight.bottom - expanded.bottom).toBe(200);
+    expect(expanded.rows - tight.rows).toBe(4);
+  });
+
+  it("maps cell paths from a shifted grid origin", () => {
+    const mask: CellMask = {
+      cols: 1,
+      rows: 1,
+      cells: Uint8Array.from([1]),
+    };
+
+    const path = cellsToPath(mask, metrics, { pixelsPerEm: 10, threshold: 0.5, expand: 0 }, {
+      left: -100,
+      top: 900,
+    });
+
+    expect(path.commands).toEqual([
+      { type: "M", x: -100, y: 800 },
+      { type: "L", x: 0, y: 800 },
+      { type: "L", x: 0, y: 900 },
+      { type: "L", x: -100, y: 900 },
+      { type: "Z" },
+    ]);
+  });
+
   it("packages generated fonts with a notice file", () => {
     const notice = buildNoticeText(
       "PixelPlease FxtrSans 20-42-0 A7K4",
@@ -260,6 +316,16 @@ function rectanglePath(): opentype.Path {
   path.lineTo(620, 0);
   path.lineTo(620, 700);
   path.lineTo(80, 700);
+  path.close();
+  return path;
+}
+
+function rectanglePathWithBounds(x1: number, y1: number, x2: number, y2: number): opentype.Path {
+  const path = new opentype.Path();
+  path.moveTo(x1, y1);
+  path.lineTo(x2, y1);
+  path.lineTo(x2, y2);
+  path.lineTo(x1, y2);
   path.close();
   return path;
 }

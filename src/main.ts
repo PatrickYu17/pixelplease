@@ -2058,7 +2058,7 @@ function makeGeneratedFontNames(source: ActiveSource, options: PixelizeOptions):
   const sourceCode = makeSourceCode(sourceFamily);
   const recipe = makeFontRecipe(options);
   const hash = makeFontNameHash([
-    "v1",
+    "v2",
     source.kind,
     sourceFamily,
     sourceCode,

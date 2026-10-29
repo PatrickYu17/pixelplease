@@ -25,6 +25,25 @@ export type FontMetrics = {
   descender: number;
 };
 
+export type PixelGrid = {
+  cellSize: number;
+  top: number;
+  bottom: number;
+  rows: number;
+};
+
+export type CellOrigin = {
+  left?: number;
+  top?: number;
+};
+
+type GlyphBounds = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+};
+
 export type CoverageItem = {
   codePoint: number;
   char: string;
@@ -120,13 +139,15 @@ export async function pixelizeFont(
 
   const metrics = getMetrics(sourceFont);
   const fontNames = makeDerivativeFontNames(metadata);
-  const glyphs: opentype.Glyph[] = [createNotDefGlyph(metrics, options)];
   const coverage = getBasicLatinCoverage(sourceFont).filter((item) => item.supported);
+  const sourceGlyphs = coverage.map((item) => sourceFont.charToGlyph(item.char));
+  const grid = getPixelGrid(sourceGlyphs, metrics, options);
+  const glyphs: opentype.Glyph[] = [createNotDefGlyph(metrics, options, grid)];
 
   for (let index = 0; index < coverage.length; index += 1) {
     const item = coverage[index];
-    const glyph = sourceFont.charToGlyph(item.char);
-    glyphs.push(pixelizeGlyph(glyph, item.codePoint, metrics, options));
+    const glyph = sourceGlyphs[index];
+    glyphs.push(pixelizeGlyph(glyph, item.codePoint, metrics, options, grid));
     onProgress?.(index + 1, coverage.length);
 
     if (index % 12 === 0) {
@@ -140,8 +161,8 @@ export async function pixelizeFont(
     fullName: fontNames.fullName,
     postScriptName: fontNames.postScriptName,
     unitsPerEm: metrics.unitsPerEm,
-    ascender: metrics.ascender,
-    descender: metrics.descender,
+    ascender: grid.top,
+    descender: grid.bottom,
     manufacturer: "pixelplease",
     license:
       "Generated derivative. Source font license controls use, modification, and redistribution.",
@@ -170,41 +191,54 @@ function pixelizeGlyph(
   codePoint: number,
   metrics: FontMetrics,
   options: PixelizeOptions,
+  grid: PixelGrid,
 ): opentype.Glyph {
   const advanceWidth = Math.max(0, sourceGlyph.advanceWidth || metrics.unitsPerEm * 0.5);
 
   if (codePoint === 32 || sourceGlyph.index === 0) {
-    return new opentype.Glyph({
+    const spaceGlyph = new opentype.Glyph({
       name: glyphName(codePoint),
       unicode: codePoint,
       advanceWidth: snapAdvance(advanceWidth, metrics, options),
       path: new opentype.Path(),
     });
+    spaceGlyph.leftSideBearing = 0;
+    return spaceGlyph;
   }
 
-  const mask = rasterizeGlyphToCells(sourceGlyph, metrics, options);
+  const { mask, left } = rasterizeGlyphToCells(sourceGlyph, metrics, options, grid);
   const expandedMask = expandCellMask(mask, options.expand);
-  const path = cellsToPath(expandedMask, metrics, options);
-
-  return new opentype.Glyph({
+  const path = cellsToPath(expandedMask, metrics, options, { left, top: grid.top });
+  const pathBounds = path.getBoundingBox();
+  const glyph = new opentype.Glyph({
     name: glyphName(codePoint),
     unicode: codePoint,
     advanceWidth: snapAdvance(advanceWidth, metrics, options),
     path,
   });
+
+  glyph.leftSideBearing = Number.isFinite(pathBounds.x1) ? pathBounds.x1 : 0;
+  return glyph;
 }
 
-export function cellsToPath(mask: CellMask, metrics: FontMetrics, options: PixelizeOptions): opentype.Path {
+export function cellsToPath(
+  mask: CellMask,
+  metrics: FontMetrics,
+  options: PixelizeOptions,
+  origin: CellOrigin = {},
+): opentype.Path {
   const path = new opentype.Path();
   const cellSize = getCellSize(metrics, options);
+  const left = origin.left ?? 0;
+  const top = origin.top ?? metrics.ascender;
 
   if (options.pixelShape === "round") {
-    addRoundCellsToPath(path, mask, metrics, cellSize);
+    addRoundCellsToPath(path, mask, cellSize, left, top);
     return path;
   }
 
   if (options.pixelShape === "vertical-lines" || options.pixelShape === "horizontal-lines") {
-    addLineCellsToPath(path, mask, metrics, cellSize, options.pixelShape);
+    addLineCellsToPath(path, mask, cellSize, left, top, options.pixelShape);
     return path;
   }
 
@@ -226,9 +260,9 @@ export function cellsToPath(mask: CellMask, metrics: FontMetrics, options: Pixel
       }
 
       const end = col;
-      const x0 = start * cellSize;
-      const x1 = end * cellSize;
-      const yTop = metrics.ascender - row * cellSize;
+      const x0 = left + start * cellSize;
+      const x1 = left + end * cellSize;
+      const yTop = top - row * cellSize;
       const yBottom = yTop - cellSize;
       addRect(path, x0, yBottom, x1, yTop);
     }
@@ -237,16 +271,22 @@ export function cellsToPath(mask: CellMask, metrics: FontMetrics, options: Pixel
   return path;
 }
 
-function addRoundCellsToPath(path: opentype.Path, mask: CellMask, metrics: FontMetrics, cellSize: number): void {
+function addRoundCellsToPath(
+  path: opentype.Path,
+  mask: CellMask,
+  cellSize: number,
+  left: number,
+  top: number,
+): void {
   for (let row = 0; row < mask.rows; row += 1) {
     for (let col = 0; col < mask.cols; col += 1) {
       if (!isCellFilled(mask, col, row)) {
         continue;
       }
 
-      const x0 = col * cellSize;
+      const x0 = left + col * cellSize;
       const x1 = x0 + cellSize;
-      const yTop = metrics.ascender - row * cellSize;
+      const yTop = top - row * cellSize;
       const yBottom = yTop - cellSize;
       addEllipse(path, x0, yBottom, x1, yTop);
     }
@@ -256,8 +296,9 @@ function addRoundCellsToPath(path: opentype.Path, mask: CellMask, metrics: FontM
 function addLineCellsToPath(
   path: opentype.Path,
   mask: CellMask,
-  metrics: FontMetrics,
   cellSize: number,
+  left: number,
+  top: number,
   pixelShape: Extract<PixelShape, "vertical-lines" | "horizontal-lines">,
 ): void {
   const inset = Math.round(cellSize * 0.28);
@@ -268,9 +309,9 @@ function addLineCellsToPath(
         continue;
       }
 
-      const x0 = col * cellSize;
+      const x0 = left + col * cellSize;
       const x1 = x0 + cellSize;
-      const yTop = metrics.ascender - row * cellSize;
+      const yTop = top - row * cellSize;
       const yBottom = yTop - cellSize;
 
       if (pixelShape === "vertical-lines") {
@@ -320,47 +361,106 @@ function rasterizeGlyphToCells(
   sourceGlyph: opentype.Glyph,
   metrics: FontMetrics,
   options: PixelizeOptions,
-): CellMask {
-  const cellSize = getCellSize(metrics, options);
+  grid: PixelGrid,
+): { mask: CellMask; left: number } {
+  const cellSize = grid.cellSize;
   const advanceWidth = Math.max(cellSize, sourceGlyph.advanceWidth || metrics.unitsPerEm * 0.5);
-  const cols = Math.max(1, Math.ceil(advanceWidth / cellSize));
-  const rows = Math.max(1, Math.ceil((metrics.ascender - metrics.descender) / cellSize));
   const samplesPerCell = 5;
   const scale = samplesPerCell / cellSize;
+  const expand = Math.max(0, Math.ceil(options.expand));
+  const shiftXUnits = clamp(options.shiftX ?? 0, -0.5, 0.5) * cellSize;
+  const shiftYUnits = clamp(options.shiftY ?? 0, -0.5, 0.5) * cellSize;
+  const bounds = getGlyphBounds(sourceGlyph);
+
+  // The source glyph may paint outside its advance width and outside the
+  // font's declared ascender/descender. Rasterize the real ink extent (plus
+  // grid shift and dilation room) so no part of the glyph is clipped.
+  const inkLeft = Math.min(0, bounds?.x1 ?? 0) + shiftXUnits;
+  const inkRight = Math.max(advanceWidth, bounds?.x2 ?? advanceWidth) + shiftXUnits;
+  const left = Math.floor(inkLeft / cellSize) * cellSize - expand * cellSize;
+  const right = Math.ceil(inkRight / cellSize) * cellSize + expand * cellSize;
+  const cols = Math.max(1, Math.round((right - left) / cellSize));
   const canvas = document.createElement("canvas");
   canvas.width = cols * samplesPerCell;
-  canvas.height = rows * samplesPerCell;
+  canvas.height = grid.rows * samplesPerCell;
 
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) {
     throw new Error("Could not create canvas context for glyph rasterization.");
   }
 
-  const shiftX = clamp(options.shiftX ?? 0, -0.5, 0.5) * samplesPerCell;
-  const shiftY = clamp(options.shiftY ?? 0, -0.5, 0.5) * samplesPerCell;
-
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.fillStyle = "#000";
-  sourceGlyph.draw(context, shiftX, metrics.ascender * scale + shiftY, metrics.unitsPerEm * scale);
+  sourceGlyph.draw(
+    context,
+    (shiftXUnits - left) * scale,
+    (grid.top + shiftYUnits) * scale,
+    metrics.unitsPerEm * scale,
+  );
 
   const threshold = clamp(options.threshold, 0.05, 0.95);
 
-  return createCellMaskFromImageData({
-    data: context.getImageData(0, 0, canvas.width, canvas.height).data,
-    width: canvas.width,
-    height: canvas.height,
-    cellSize: samplesPerCell,
-    threshold,
-    mode: "alpha",
-  });
+  return {
+    left,
+    mask: createCellMaskFromImageData({
+      data: context.getImageData(0, 0, canvas.width, canvas.height).data,
+      width: canvas.width,
+      height: canvas.height,
+      cellSize: samplesPerCell,
+      threshold,
+      mode: "alpha",
+    }),
+  };
 }
 
-function createNotDefGlyph(metrics: FontMetrics, options: PixelizeOptions): opentype.Glyph {
+export function getPixelGrid(
+  sourceGlyphs: opentype.Glyph[],
+  metrics: FontMetrics,
+  options: PixelizeOptions,
+): PixelGrid {
+  const cellSize = getCellSize(metrics, options);
+  const expand = Math.max(0, Math.ceil(options.expand));
+  const shiftYUnits = clamp(options.shiftY ?? 0, -0.5, 0.5) * cellSize;
+  let inkTop = metrics.ascender;
+  let inkBottom = metrics.descender;
+
+  for (const glyph of sourceGlyphs) {
+    const bounds = getGlyphBounds(glyph);
+    if (!bounds) {
+      continue;
+    }
+
+    inkTop = Math.max(inkTop, bounds.y2 - shiftYUnits);
+    inkBottom = Math.min(inkBottom, bounds.y1 - shiftYUnits);
+  }
+
+  const top = Math.ceil(inkTop / cellSize) * cellSize + expand * cellSize;
+  const bottom = Math.floor(inkBottom / cellSize) * cellSize - expand * cellSize;
+  const rows = Math.max(1, Math.round((top - bottom) / cellSize));
+
+  return { cellSize, top, bottom, rows };
+}
+
+function getGlyphBounds(glyph: opentype.Glyph): GlyphBounds | null {
+  const bounds = glyph.getBoundingBox();
+  if (
+    !Number.isFinite(bounds.x1) ||
+    !Number.isFinite(bounds.y1) ||
+    !Number.isFinite(bounds.x2) ||
+    !Number.isFinite(bounds.y2)
+  ) {
+    return null;
+  }
+
+  return bounds;
+}
+
+function createNotDefGlyph(metrics: FontMetrics, options: PixelizeOptions, grid: PixelGrid): opentype.Glyph {
   const cellSize = getCellSize(metrics, options);
   const path = new opentype.Path();
   const width = Math.round(metrics.unitsPerEm * 0.5 / cellSize) * cellSize;
-  const top = Math.round(metrics.ascender / cellSize) * cellSize;
-  const bottom = Math.round(metrics.descender / cellSize) * cellSize;
+  const top = grid.top;
+  const bottom = grid.bottom;
 
   addRect(path, 0, bottom, width, top);
   addRect(path, cellSize, bottom + cellSize, width - cellSize, top - cellSize, true);

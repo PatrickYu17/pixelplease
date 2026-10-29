@@ -50,6 +50,44 @@ test("Bangers generates locally and exports its source license", async ({ page }
   expect(externalRequests).toEqual([]);
 });
 
+test("keeps glyph ink that overhangs the advance width in the exported font", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.locator("#app-status")).toHaveText(UI_COPY.status.generatedReady);
+  const previous = await getGeneratedFontUrl(page);
+  await page.locator("#google-font-select").selectOption("Bangers");
+  await expect.poll(async () => {
+    const current = await getGeneratedFontUrl(page);
+    return Boolean(current && current !== previous);
+  }).toBe(true);
+
+  const generatedBuffer = await getGeneratedFontBuffer(page);
+  const parsed = opentype.parse(generatedBuffer);
+  const sourceBuffer = await fs.readFile(path.resolve("public/fonts/google/bangers/Bangers-Regular.ttf"));
+  const source = opentype.parse(sourceBuffer.buffer.slice(sourceBuffer.byteOffset, sourceBuffer.byteOffset + sourceBuffer.byteLength));
+  const cellSize = parsed.unitsPerEm / 20;
+
+  // Bangers paints well outside its advance widths. The old exporter clipped
+  // the raster box to the advance, slicing the right side off every glyph.
+  for (let codePoint = 33; codePoint <= 126; codePoint += 1) {
+    const char = String.fromCharCode(codePoint);
+    const sourceGlyph = source.charToGlyph(char);
+    const generatedGlyph = parsed.charToGlyph(char);
+    if (sourceGlyph.index === 0 || generatedGlyph.index === 0) {
+      continue;
+    }
+
+    const sourceBounds = sourceGlyph.getBoundingBox();
+    const generatedBounds = generatedGlyph.getBoundingBox();
+    expect(sourceBounds.x2 - generatedBounds.x2, `${char} right edge`).toBeLessThanOrEqual(cellSize);
+    expect(generatedBounds.x1 - sourceBounds.x1, `${char} left edge`).toBeLessThanOrEqual(cellSize);
+  }
+
+  const generatedH = parsed.charToGlyph("H");
+  const sourceH = source.charToGlyph("H");
+  expect(sourceH.getBoundingBox().x2).toBeGreaterThan(sourceH.advanceWidth ?? 0);
+  expect(generatedH.getBoundingBox().x2).toBeGreaterThan(generatedH.advanceWidth ?? 0);
+});
+
 test("shows a centered creator credit using the FAQ subtitle typography", async ({ page }) => {
   await page.goto("/");
 
@@ -1868,6 +1906,27 @@ test("handles a real permissive Google Fonts TTF sample", async ({ page }) => {
 
 async function getGeneratedFontUrl(page: Page): Promise<string | null> {
   return page.locator("#download-link").getAttribute("data-generated-font-url");
+}
+
+async function getGeneratedFontBuffer(page: Page): Promise<ArrayBuffer> {
+  const blobUrl = await getGeneratedFontUrl(page);
+  if (!blobUrl) {
+    throw new Error("Generated font URL is missing.");
+  }
+
+  const base64 = await page.evaluate(async (url) => {
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 1) {
+      binary += String.fromCharCode(bytes[index]);
+    }
+    return btoa(binary);
+  }, blobUrl);
+
+  const binary = Buffer.from(base64, "base64");
+  return binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
 }
 
 function getSingleTtfEntry(entries: Record<string, Uint8Array>): [string, Uint8Array] {
